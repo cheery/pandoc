@@ -19,6 +19,7 @@ module Text.Pandoc.Readers.WordProcessing (readWordProcessing ) where
 
 import Prelude
 import Data.Text (Text, pack, groupBy, head)
+import Text.Read (readMaybe)
 import qualified Data.Text as T
 import qualified Data.Map as M
 -- import Data.Text.IO (readFile, putStrLn)
@@ -27,14 +28,14 @@ import qualified Data.Map as M
 -- import System.Exit (exitWith, ExitCode(..))
 -- import System.IO (stderr, hPutStrLn)
 
-import Control.Monad
+--import Control.Monad
 import Control.Monad.Except (throwError)
 -- import Data.Char (isAlphaNum, isPunctuation, isSpace)
 -- import Data.List (sortBy, transpose, elemIndex)
 -- import qualified Data.Map as M
 -- import Data.Maybe
 -- import Data.Ord (comparing)
--- import qualified Data.Set as Set
+import qualified Data.Set as S
 -- import Data.Text (Text)
 -- import qualified Data.Text as T
 -- import qualified Data.Text.Lazy as TL
@@ -63,38 +64,95 @@ readWordProcessing :: PandocMonad m
                    => ReaderOptions
                    -> Text
                    -> m Pandoc
-readWordProcessing opts s = do
+readWordProcessing _ s = do
     let result = parseWP s
     case result of
         Left _ -> throwError (PandocParseError "bork")
         Right root ->
-            return (just_paragraphs root)
+            case read_dtd root of
+                Just root' -> build_blocks root'
+                Nothing -> throwError (PandocParseError "dtd;pandoc -attribute missing, is this a pandoc wp file?")
 
-just_paragraphs :: Element -> Pandoc
-just_paragraphs elem =
-    Pandoc (Meta { unMeta = M.empty }) (foldr g [] elem)
+-- DTD recognition
+read_dtd :: Element -> Maybe Element
+read_dtd (Attr "dtd" ["pandoc"]:eleme) = Just eleme
+read_dtd (Text t:Attr "dtd" ["pandoc"]:eleme) = Just (Text t:eleme)
+read_dtd _ = Nothing
+
+-- Block processing
+build_blocks :: PandocMonad m => Element -> m Pandoc
+build_blocks eleme = foldr f (return blank_pandoc) eleme
     where
+    blank_pandoc = Pandoc (Meta { unMeta = M.empty }) []
+    f :: PandocMonad m => Node -> m Pandoc -> m Pandoc
+    f (Attr "meta" [key, str]) pfn = do
+        (Pandoc meta block) <- pfn
+        let meta' = Meta { unMeta = M.insert key (MetaString str) (unMeta meta) }
+        return (Pandoc meta' block)
+    f (Elem nodes) pfn = do
+        (Pandoc meta block) <- pfn
+        let sh = shape_uniq nodes
+        if S.member ("meta",2) sh then do
+            let [a] = (retrieve_attr_args ("meta", 2) nodes)
+            -- TODO
+            return (Pandoc meta block)
+        else if S.member ("heading",2) sh then do
+            let [a] = (retrieve_attr_args ("heading", 2) nodes)
+            case readMaybe (T.unpack a) of
+                Nothing -> throwError (PandocParseError "non-integer heading argument")
+                Just i -> do
+                    let hdr = Header i nullAttr (foldr make_inline [] nodes)
+                    return (Pandoc meta (hdr : block))
+        else do
+            let blks = foldr g [] (map Elem (break_paragraphs nodes))
+            return (Pandoc meta (blks ++ block))
+    f _ pfn = pfn
     g :: Node -> [Block] -> [Block]
-    g (Elem xs) z = foldr f z (map Elem (break_paragraphs xs))
+    g (Elem xs) z = Para (foldr make_inline [] xs) : z
     g _ z = z
-    f :: Node -> [Block] -> [Block]
-    f (Elem xs) z = Para (foldr make_inline [] xs) : z
-    f _ z = z
-    make_inline :: Node -> [Inline] -> [Inline]
-    make_inline (Text txt) z = Str txt : z
-    make_inline (Elem xs) z = Span nullAttr (foldr make_inline [] xs) : z
-    make_inline (Attr _ _) z = z
+
+make_inline :: Node -> [Inline] -> [Inline]
+make_inline (Text txt) z = Str txt : z
+make_inline (Elem xs) z = Span nullAttr (foldr make_inline [] xs) : z
+make_inline (Attr _ _) z = z
+
+-- Retrieve arguments of a signature
+-- Assuming that the argument is present.
+retrieve_attr_args :: Signature -> Element -> [Text]
+retrieve_attr_args _ [] = undefined
+retrieve_attr_args a (Attr x y:_) | (attr_signature x y == a) = y
+retrieve_attr_args a (_:xs) = retrieve_attr_args a xs
+
+-- Retrieve signature of an element
+type Signature = (Text,Int)
+
+shape_uniq :: Element -> S.Set Signature
+shape_uniq xs = M.keysSet (M.filter (==1) (shape_counts xs))
+
+shape_counts :: Element -> M.Map Signature Int
+shape_counts [] = M.empty
+shape_counts (Attr a as:xs) =
+    M.alter perhaps_increment (attr_signature a as) (shape_counts xs)
+shape_counts (_:xs) = shape_counts xs
+
+perhaps_increment :: Maybe Int -> Maybe Int
+perhaps_increment Nothing = Just 1
+perhaps_increment (Just i) = Just (i+1)
+
+attr_signature :: Text -> [Text] -> Signature
+attr_signature first rest = (first, length rest + 1)
 
 -- Break text nodes into paragraphs while otherwise preserving structure.
 break_paragraphs :: [Node] -> [[Node]]
 break_paragraphs [] = [[]]
-break_paragraphs (Text a:xs) = let
-    (y:ys) = break_paragraphs xs
-    in splice y ys (text_to_paragraphs a)
+break_paragraphs (Text txt:zs) = let
+    (y:ys) = break_paragraphs zs
+    in splice y ys (text_to_paragraphs txt)
     where
     splice :: [Node] -> [[Node]] -> [Text] -> [[Node]]
     splice y ys [t] = (Text t:y):ys
     splice y ys (t:ts) = [Text t]:splice y ys ts
+    splice _ _ _ = undefined
     text_to_paragraphs :: Text -> [Text]
     text_to_paragraphs a = (tk_xs (T.foldr sepfn ("",[],Any) a))
     tk_xs (cs,xs,_) = cs:xs
