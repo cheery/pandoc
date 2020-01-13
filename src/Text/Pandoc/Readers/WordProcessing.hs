@@ -93,16 +93,22 @@ build_blocks eleme = foldr f (return blank_pandoc) eleme
         (Pandoc meta block) <- pfn
         let sh = shape_uniq nodes
         if S.member ("meta",2) sh then do
-            let [a] = (retrieve_attr_args ("meta", 2) nodes)
-            -- TODO
-            return (Pandoc meta block)
+            case retrieve_attr_args ("meta", 2) nodes of
+                [key] -> do
+                    new_value <- make_meta sh nodes
+                    let meta' = Meta { unMeta = M.insert key new_value (unMeta meta) }
+                    return (Pandoc meta' block)
+                _ -> undefined
         else if S.member ("heading",2) sh then do
-            let [a] = (retrieve_attr_args ("heading", 2) nodes)
-            case readMaybe (T.unpack a) of
-                Nothing -> throwError (PandocParseError "non-integer heading argument")
-                Just i -> do
-                    let hdr = Header i nullAttr (foldr make_inline [] nodes)
-                    return (Pandoc meta (hdr : block))
+            case retrieve_attr_args ("heading", 2) nodes of
+                [a] -> do
+                    case readMaybe (T.unpack a) of
+                        Nothing ->
+                            throwError (PandocParseError "non-integer heading argument")
+                        Just i -> do
+                            let hdr = Header i nullAttr (foldr make_inline [] nodes)
+                            return (Pandoc meta (hdr : block))
+                _ -> undefined
         else do
             let blks = foldr g [] (map Elem (break_paragraphs nodes))
             return (Pandoc meta (blks ++ block))
@@ -110,6 +116,47 @@ build_blocks eleme = foldr f (return blank_pandoc) eleme
     g :: Node -> [Block] -> [Block]
     g (Elem xs) z = Para (foldr make_inline [] xs) : z
     g _ z = z
+
+make_meta :: PandocMonad m => Shape -> Element -> m MetaValue
+make_meta shp nodes | S.member ("map", 1) shp =
+    let each e = do
+            let shp' = shape_uniq e
+            if S.member ("key",2) shp' then do
+                case retrieve_attr_args ("key",2) e of
+                    [key] -> do
+                        mv <- make_meta shp' e
+                        return (key, mv)
+                    _ -> undefined
+            else do
+                throwError (PandocParseError "key missing in a map field")
+    in do
+        mapM each (sub_elements nodes) >>= return . MetaMap . M.fromList
+
+make_meta shp nodes | S.member ("list", 1) shp =
+    mapM (\e -> make_meta (shape_uniq e) e)
+        (sub_elements nodes) >>= return . MetaList
+make_meta shp _ | S.member ("true", 1) shp = return $ MetaBool True
+make_meta shp _ | S.member ("false", 1) shp = return $ MetaBool False
+make_meta shp nodes | S.member ("str", 1) shp = return $
+    MetaString (as_plain_text nodes)
+make_meta shp nodes | S.member ("^", 1) shp = return $
+    MetaBlocks (make_block nodes)
+make_meta _ nodes = return $
+    MetaInlines (foldr make_inline [] nodes)
+
+make_block :: Element -> [Block]
+make_block _ = []
+
+as_plain_text :: Element -> Text
+as_plain_text (Text t:xs) = T.concat [t, as_plain_text xs]
+as_plain_text (Elem e:xs) = T.concat [as_plain_text e, as_plain_text xs]
+as_plain_text (_:xs) = as_plain_text xs
+as_plain_text [] = ""
+
+sub_elements :: Element -> [Element]
+sub_elements (Elem e:xs) = e : sub_elements xs
+sub_elements (_:xs) = sub_elements xs
+sub_elements [] = []
 
 make_inline :: Node -> [Inline] -> [Inline]
 make_inline (Text txt) z = Str txt : z
@@ -124,6 +171,7 @@ retrieve_attr_args a (Attr x y:_) | (attr_signature x y == a) = y
 retrieve_attr_args a (_:xs) = retrieve_attr_args a xs
 
 -- Retrieve signature of an element
+type Shape = S.Set Signature
 type Signature = (Text,Int)
 
 shape_uniq :: Element -> S.Set Signature
@@ -145,9 +193,9 @@ attr_signature first rest = (first, length rest + 1)
 -- Break text nodes into paragraphs while otherwise preserving structure.
 break_paragraphs :: [Node] -> [[Node]]
 break_paragraphs [] = [[]]
-break_paragraphs (Text txt:zs) = let
-    (y:ys) = break_paragraphs zs
-    in splice y ys (text_to_paragraphs txt)
+break_paragraphs (Text txt:zs) = case break_paragraphs zs of
+    (y:ys) -> splice y ys (text_to_paragraphs txt)
+    _ -> undefined
     where
     splice :: [Node] -> [[Node]] -> [Text] -> [[Node]]
     splice y ys [t] = (Text t:y):ys
@@ -163,9 +211,9 @@ break_paragraphs (Text txt:zs) = let
             (PRNL, Any) -> ("", T.stripStart cs:xs, Any)
             (_, _) -> (T.cons char cs, xs, pr')
 
-break_paragraphs (other:xs) = let
-    (y:ys) = break_paragraphs xs
-    in ((other:y):ys)
+break_paragraphs (other:xs) = case break_paragraphs xs of
+    (y:ys) -> ((other:y):ys)
+    _ -> undefined
 
 data ParaBreaker = Any | NLSP | PRNL
 
