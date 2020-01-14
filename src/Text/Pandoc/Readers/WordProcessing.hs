@@ -22,6 +22,7 @@ import Data.Text (Text, pack, groupBy, head)
 import Text.Read (readMaybe)
 import qualified Data.Text as T
 import qualified Data.Map as M
+import Data.Maybe (catMaybes, mapMaybe)
 -- import Data.Text.IO (readFile, putStrLn)
 -- import System.Environment (getArgs)
 -- import Data.List (intercalate)
@@ -70,7 +71,7 @@ readWordProcessing _ s = do
         Left _ -> throwError (PandocParseError "bork")
         Right root ->
             case read_dtd root of
-                Just root' -> build_blocks root'
+                Just root' -> as_toplevel root'
                 Nothing -> throwError (PandocParseError "dtd;pandoc -attribute missing, is this a pandoc wp file?")
 
 -- DTD recognition
@@ -79,116 +80,295 @@ read_dtd (Attr "dtd" ["pandoc"]:eleme) = Just eleme
 read_dtd (Text t:Attr "dtd" ["pandoc"]:eleme) = Just (Text t:eleme)
 read_dtd _ = Nothing
 
--- Block processing
-build_blocks :: PandocMonad m => Element -> m Pandoc
-build_blocks eleme = foldr f (return blank_pandoc) eleme
+data ToplevelDef = MetaDef Text
+                 | BlockDef BlockDef
+
+data BlockDef = ParDef
+              | PlainDef 
+              | HeaderDef Int (Text, [Text])
+              | CodeBlockDef (Text, [Text])
+              | DivDef (Text, [Text])
+              -- | LineBlockDef
+              -- | RawBlockDef Format
+              -- | BlockQuoteDef 
+              -- | OrderedListDef Int ListNumberStyle ListNumberDelim
+              -- | BulletListDef
+              -- | TableDef
+
+        -- | LineBlock [[Inline]]  -- ^ Multiple non-breaking lines
+        -- | RawBlock Format Text -- ^ Raw block ?not sure if I use it here.
+        -- | BlockQuote [Block]    -- ^ Block quote (list of blocks)
+        -- | OrderedList ListAttributes [[Block]] -- ^ Ordered list (attributes
+        --                         -- and a list of items, each a list of blocks)
+        --type ListAttributes = (Int, ListNumberStyle, ListNumberDelim)
+        -- 
+        -- -- | Style of list numbers.
+        -- data ListNumberStyle = DefaultStyle
+        --                      | Example
+        --                      | Decimal
+        --                      | LowerRoman
+        --                      | UpperRoman
+        --                      | LowerAlpha
+        --                      | UpperAlpha deriving (Eq, Ord, Show, Read, Typeable, Data, Generic)
+        -- 
+        -- -- | Delimiter of list numbers.
+        -- data ListNumberDelim = DefaultDelim
+        --                      | Period
+        --                      | OneParen
+        --                      | TwoParens deriving (Eq, Ord, Show, Read, Typeable, Data, Generic)
+        --
+        -- | BulletList [[Block]]  -- ^ Bullet list (list of items, each
+        --                         -- a list of blocks)
+        -- | DefinitionList [([Inline],[[Block]])]  -- ^ Definition list
+        --                         -- Each list item is a pair consisting of a
+        --                         -- term (a list of inlines) and one or more
+        --                         -- definitions (each a list of blocks)
+        -- | Table [Inline] [Alignment] [Double] [TableCell] [[TableCell]]  -- ^ Table,
+        --                         -- with caption, column alignments (required),
+        --                         -- relative column widths (0 = default),
+        --                         -- column headers (each a list of blocks), and
+        --                         -- rows (each a list of lists of blocks)
+
+
+data MetaDef = MetaMapDef
+             | MetaListDef
+             | MetaTrueDef
+             | MetaFalseDef
+             | MetaStringDef
+             | MetaInlinesDef
+             | MetaBlocksDef
+
+as_toplevel :: PandocMonad m => Element -> m (Pandoc)
+as_toplevel xs = (mapM toplevel_map xs) >>= return . (foldl mappend mempty)
+
+as_blocks :: PandocMonad m => Element -> m [Block] 
+as_blocks = concatMapM block_map
+
+as_meta_value :: PandocMonad m => Element -> m MetaValue
+as_meta_value xs = do
+    md <- identify_it identify_meta (return MetaInlinesDef) xs
+    build_meta_value md xs
+
+toplevel_map :: PandocMonad m => Node -> m Pandoc
+toplevel_map (Text _) = return (Pandoc (Meta { unMeta = M.empty }) [])
+toplevel_map (Attr "meta" [key, str]) = do
+    return (Pandoc (Meta { unMeta = M.singleton key (MetaString str) }) [])
+toplevel_map (Attr "hr" []) = return (Pandoc (Meta { unMeta = M.empty }) [HorizontalRule])
+toplevel_map (Attr "null" []) = return (Pandoc (Meta { unMeta = M.empty }) [Null])
+toplevel_map (Elem xs) = do
+    bd <- identify_it identify_toplevel (return (BlockDef ParDef)) xs
+    build_toplevel_elem bd xs
+toplevel_map _ = return (Pandoc (Meta { unMeta = M.empty }) [])
+
+block_map :: PandocMonad m => Node -> m [Block]
+block_map (Text _) = return []
+block_map (Attr "hr" []) = return [HorizontalRule]
+block_map (Attr "null" []) = return [Null]
+block_map (Elem xs) = do
+    bd <- identify_it identify_block (return ParDef) xs
+    build_block_elem bd xs
+block_map _ = return []
+
+identify_it :: PandocMonad m
+            => (Node -> m (Maybe a)) -- Selector
+            -> m a                   -- Empty element
+            -> Element -> m a
+identify_it fn e node = mapMaybeM fn node >>= select
     where
-    blank_pandoc = Pandoc (Meta { unMeta = M.empty }) []
-    f :: PandocMonad m => Node -> m Pandoc -> m Pandoc
-    f (Attr "meta" [key, str]) pfn = do
-        (Pandoc meta block) <- pfn
-        let meta' = Meta { unMeta = M.insert key (MetaString str) (unMeta meta) }
-        return (Pandoc meta' block)
-    f (Elem nodes) pfn = do
-        (Pandoc meta block) <- pfn
-        let sh = shape_uniq nodes
-        if S.member ("meta",2) sh then do
-            case retrieve_attr_args ("meta", 2) nodes of
-                [key] -> do
-                    new_value <- make_meta sh nodes
-                    let meta' = Meta { unMeta = M.insert key new_value (unMeta meta) }
-                    return (Pandoc meta' block)
-                _ -> undefined
-        else if S.member ("heading",2) sh then do
-            case retrieve_attr_args ("heading", 2) nodes of
-                [a] -> do
-                    case readMaybe (T.unpack a) of
-                        Nothing ->
-                            throwError (PandocParseError "non-integer heading argument")
-                        Just i -> do
-                            let hdr = Header i nullAttr (foldr make_inline [] nodes)
-                            return (Pandoc meta (hdr : block))
-                _ -> undefined
-        else do
-            let blks = foldr g [] (map Elem (break_paragraphs nodes))
-            return (Pandoc meta (blks ++ block))
-    f _ pfn = pfn
-    g :: Node -> [Block] -> [Block]
-    g (Elem xs) z = Para (foldr make_inline [] xs) : z
-    g _ z = z
+    select (_:_:_) = throwError (PandocParseError "ambiguous attributes in an element")
+    select [a] = return a
+    select [] = e
 
-make_meta :: PandocMonad m => Shape -> Element -> m MetaValue
-make_meta shp nodes | S.member ("map", 1) shp =
-    let each e = do
-            let shp' = shape_uniq e
-            if S.member ("key",2) shp' then do
-                case retrieve_attr_args ("key",2) e of
-                    [key] -> do
-                        mv <- make_meta shp' e
-                        return (key, mv)
-                    _ -> undefined
-            else do
-                throwError (PandocParseError "key missing in a map field")
-    in do
-        mapM each (sub_elements nodes) >>= return . MetaMap . M.fromList
+identify_toplevel :: PandocMonad m => Node -> m (Maybe ToplevelDef)
+identify_toplevel (Attr "meta" [name]) = (return . Just) (MetaDef name)
+identify_toplevel a = do
+    bd <- identify_block a
+    return (bd >>= Just . BlockDef)
 
-make_meta shp nodes | S.member ("list", 1) shp =
-    mapM (\e -> make_meta (shape_uniq e) e)
-        (sub_elements nodes) >>= return . MetaList
-make_meta shp _ | S.member ("true", 1) shp = return $ MetaBool True
-make_meta shp _ | S.member ("false", 1) shp = return $ MetaBool False
-make_meta shp nodes | S.member ("str", 1) shp = return $
-    MetaString (as_plain_text nodes)
-make_meta shp nodes | S.member ("^", 1) shp = return $
-    MetaBlocks (make_block nodes)
-make_meta _ nodes = return $
-    MetaInlines (foldr make_inline [] nodes)
+identify_block :: PandocMonad m => Node -> m (Maybe BlockDef)
+identify_block (Attr "plain" []) = (return . Just) (PlainDef)
+identify_block (Attr "header" [depth]) = case readMaybe (T.unpack depth) of
+    Nothing -> throwError (PandocParseError "non-integer header argument")
+    Just i -> (return . Just) (HeaderDef i ("", []))
+identify_block (Attr "header" [depth, sel]) = case readMaybe (T.unpack depth) of
+    Nothing -> throwError (PandocParseError "non-integer header argument")
+    Just i -> case identify_selector sel of
+        Nothing -> throwError (PandocParseError "malformed selector string in header")
+        Just k -> (return . Just) (HeaderDef i k)
+identify_block (Attr "code" []) = (return . Just) (CodeBlockDef ("", []))
+identify_block (Attr "code" [sel]) = case identify_selector sel of
+    Nothing -> throwError (PandocParseError "malformed selector string in code block")
+    Just k -> (return . Just) (CodeBlockDef k)
+identify_block (Attr sel []) = case identify_selector sel of
+    Nothing -> return Nothing
+    Just k -> (return . Just) (DivDef k)
+identify_block _ = return Nothing
 
-make_block :: Element -> [Block]
-make_block _ = []
+identify_meta :: PandocMonad m => Node -> m (Maybe MetaDef)
+identify_meta (Attr "map" []) = (return . Just) (MetaMapDef)
+identify_meta (Attr "list" []) = (return . Just) (MetaListDef)
+identify_meta (Attr "true" []) = (return . Just) (MetaTrueDef)
+identify_meta (Attr "false" []) = (return . Just) (MetaFalseDef)
+identify_meta (Attr "str" []) = (return . Just) (MetaStringDef)
+identify_meta (Attr "^" []) = (return . Just) (MetaBlocksDef)
+identify_meta _ = return Nothing
 
+identify_key :: PandocMonad m => Node -> m (Maybe Text)
+identify_key (Attr "key" [key]) = (return . Just) key
+identify_key _ = return Nothing
+
+build_toplevel_elem :: PandocMonad m => ToplevelDef -> Element -> m Pandoc
+build_toplevel_elem (MetaDef name) xs = do
+    new_value <- as_meta_value xs
+    return (Pandoc (Meta { unMeta = M.singleton name new_value }) [])
+build_toplevel_elem (BlockDef bd) xs = do
+    build_block_elem bd xs >>= return . (Pandoc (Meta { unMeta = M.empty }))
+
+build_block_elem :: PandocMonad m => BlockDef -> Element -> m [Block]
+build_block_elem (ParDef) xs = do
+    return (map (Para . as_inline) (break_paragraphs xs))
+build_block_elem (PlainDef) xs = do
+    return [Plain (as_inline xs)]
+build_block_elem (HeaderDef i k) xs = do
+    return [Header i (as_attrs k xs) (as_inline xs)]
+build_block_elem (CodeBlockDef k) xs = do
+    return [CodeBlock (as_attrs k xs) (as_plain_text xs)]
+    -- TODO: Add possibility to wrap code-part into element.
+build_block_elem (DivDef k) xs =
+    -- TODO: Add possibility to provide actual block div.
+    return [Div (as_attrs k xs) [Plain (as_inline xs)]]
+
+build_meta_value :: PandocMonad m => MetaDef -> Element -> m MetaValue
+build_meta_value MetaMapDef xs =
+    let each ys = do
+            key <- identify_it identify_key
+                               (throwError (PandocParseError "key missing in a map field"))
+                               ys
+            mv <- as_meta_value ys
+            return (key, mv)
+    in mapM each (sub_elements xs) >>= return . MetaMap . M.fromList
+build_meta_value MetaListDef xs =
+    mapM as_meta_value (sub_elements xs) >>= return . MetaList
+build_meta_value MetaTrueDef _ = return (MetaBool True)
+build_meta_value MetaFalseDef _ = return (MetaBool False)
+build_meta_value MetaStringDef xs = return (MetaString (as_plain_text xs))
+build_meta_value MetaInlinesDef xs = return (MetaInlines (as_inline xs))
+build_meta_value MetaBlocksDef xs = do
+    as_blocks xs >>= return . MetaBlocks
+
+as_inline :: Element -> [Inline]
+as_inline = foldr make_inline []
+
+make_inline :: Node -> [Inline] -> [Inline]
+make_inline (Text txt) z = Str txt : z
+make_inline (Elem xs) z = Span nullAttr (foldr make_inline [] xs) : z
+make_inline (Attr "_" _) z = Space : z -- Inter-word space
+make_inline (Attr "-" _) z = SoftBreak : z -- Soft line break
+make_inline (Attr "br" _) z = LineBreak : z -- Hard line break
+make_inline (Attr _ _) z = z
+
+-- (_) as 'inter word space'
+-- (-) as 'soft break'
+-- (br) as 'hard break'
+
+-- Identify the role of the element.
+-- Create pipe to decorate it.
+--        | Emph [Inline]         -- ^ Emphasized text (list of inlines)
+--        | Strong [Inline]       -- ^ Strongly emphasized text (list of inlines)
+--        | Strikeout [Inline]    -- ^ Strikeout text (list of inlines)
+--        | Superscript [Inline]  -- ^ Superscripted text (list of inlines)
+--        | Subscript [Inline]    -- ^ Subscripted text (list of inlines)
+--        | SmallCaps [Inline]    -- ^ Small caps text (list of inlines)
+--        | Quoted QuoteType [Inline] -- ^ Quoted text (list of inlines)
+--          (SingleQuote | DoubleQuote)
+--
+--        These may 'alternate'
+--
+--        | Link Attr [Inline] Target  -- ^ Hyperlink: alt text (list of inlines), target
+--          (href;src)
+--          (href;src;#ident.class)
+--        | Span Attr [Inline]    -- ^ Generic inline container with attributes
+--          (span)
+--          (span;#ident.class)
+--        | Image Attr [Inline] Target -- ^ Image:  alt text (list of inlines), target
+--          (img;src) should be allowed on block-level as well.
+--          (img;src;#ident.class)
+--        | Code Attr Text      -- ^ Inline code (literal)
+--          (code)
+--          (code;#ident.class)
+--
+-- Handle ins-attrs.
+
+-- (texmath)
+--    data Inline
+--        | Math MathType Text  -- ^ TeX math (literal)
+--          (math)
+--        | Note [Block]          -- ^ Footnote or endnote
+--          (note) (^) -trick here as well, down to 'Plain' if not such item.
+--
+--        | Cite [Citation]  [Inline] -- ^ Citation (list of inlines)
+--        Not sure how to handle the complex structure.
+--
+--        | RawInline Format Text -- ^ Raw inline
+--          Not sure I want to use it.
+
+-- use AlignDefault on default
+identify_align :: PandocMonad m => Node -> m (Maybe Alignment)
+identify_align (Attr "left" []) = (return . Just) AlignLeft
+identify_align (Attr "right" []) = (return . Just) AlignRight
+identify_align (Attr "center" []) = (return . Just) AlignCenter
+identify_align _ = return Nothing
+
+        -- TableCell is just [Block], can do the (^) -trick to handle it.
+        --
+        -- could look up all #xxx.yy.z -attributes and act on them.
+        --else if S.member ("div",1) sh then
+        -- | Div Attr [Block]      -- ^ Generic block container with attributes
+        --   Use the (^) -trick here as well.
+        --   Demote down to 'Plain' if it's not a full block.
+        
+        -- Consider making these short attributes.
+        -- --more likely they don't interfere with ordinary use if done that way.
+
+
+-- Used for node transformation into blocks and inline elements.
+concatMapM :: Monad m => (a -> m [b]) -> [a] -> m [b]
+concatMapM f xs = (mapM f xs >>= return . concat)
+
+-- Used for node identification
+mapMaybeM :: Monad m => (a -> m (Maybe b)) -> [a] -> m [b]
+mapMaybeM f xs = (mapM f xs >>= return . catMaybes)
+
+-- Attribute handling.
+as_attrs :: (Text, [Text]) -> Element -> Attr
+as_attrs (ident, classes) xs = (ident, classes, mapMaybe identify_attrib xs)
+
+identify_attrib :: Node -> Maybe (Text, Text)
+identify_attrib (Attr "\"" [name, value]) = Just (name, value)
+identify_attrib _ = Nothing
+
+-- Treat whole element as plain text
 as_plain_text :: Element -> Text
 as_plain_text (Text t:xs) = T.concat [t, as_plain_text xs]
 as_plain_text (Elem e:xs) = T.concat [as_plain_text e, as_plain_text xs]
 as_plain_text (_:xs) = as_plain_text xs
 as_plain_text [] = ""
 
+-- Take sub-elements out of an element.
 sub_elements :: Element -> [Element]
 sub_elements (Elem e:xs) = e : sub_elements xs
 sub_elements (_:xs) = sub_elements xs
 sub_elements [] = []
 
-make_inline :: Node -> [Inline] -> [Inline]
-make_inline (Text txt) z = Str txt : z
-make_inline (Elem xs) z = Span nullAttr (foldr make_inline [] xs) : z
-make_inline (Attr _ _) z = z
+-- Identifies selectors (#|.)text(.text)*
+identify_selector :: Text -> Maybe (Text, [Text])
+identify_selector t | (T.take 1 t == "#") = case T.splitOn "." (T.drop 1 t) of
+    (x:xs) -> Just (x, xs)
+    _ -> Just ("", [])
+identify_selector t | (T.take 1 t == ".") = Just ("", T.splitOn "." (T.drop 1 t))
+identify_selector _ = Nothing
 
--- Retrieve arguments of a signature
--- Assuming that the argument is present.
-retrieve_attr_args :: Signature -> Element -> [Text]
-retrieve_attr_args _ [] = undefined
-retrieve_attr_args a (Attr x y:_) | (attr_signature x y == a) = y
-retrieve_attr_args a (_:xs) = retrieve_attr_args a xs
-
--- Retrieve signature of an element
-type Shape = S.Set Signature
-type Signature = (Text,Int)
-
-shape_uniq :: Element -> S.Set Signature
-shape_uniq xs = M.keysSet (M.filter (==1) (shape_counts xs))
-
-shape_counts :: Element -> M.Map Signature Int
-shape_counts [] = M.empty
-shape_counts (Attr a as:xs) =
-    M.alter perhaps_increment (attr_signature a as) (shape_counts xs)
-shape_counts (_:xs) = shape_counts xs
-
-perhaps_increment :: Maybe Int -> Maybe Int
-perhaps_increment Nothing = Just 1
-perhaps_increment (Just i) = Just (i+1)
-
-attr_signature :: Text -> [Text] -> Signature
-attr_signature first rest = (first, length rest + 1)
+-- Target: (URL, title) -- 'title' as different attribute.
 
 -- Break text nodes into paragraphs while otherwise preserving structure.
 break_paragraphs :: [Node] -> [[Node]]
